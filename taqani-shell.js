@@ -1,5 +1,5 @@
 /* TAQANI phase 1. No device commands, credentials or customer data. */
-export const VERSION = '0.2.2';
+export const VERSION = '0.3.0';
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export function areaOrder(area, labels) {
   for (const id of area.labels || []) {
@@ -111,6 +111,37 @@ export async function saveSettings(hass, path, expected, next) {
   return config;
 }
 
+// Only locally approved functional roles are eligible for aggregate controls.
+export function scopedEntities(settings,entities,devices,areas,scope){
+  const [kind,id]=scope.split(':');
+  const approved=[...new Set(['lights','climates','televisions','covers'].flatMap(k=>Array.isArray(settings[k])?settings[k]:[]))];
+  const allowed=entity=>{const domain=entity.split('.')[0];return (settings.lights||[]).includes(entity)&&['light','switch'].includes(domain)||(settings.climates||[]).includes(entity)&&domain==='climate'||(settings.televisions||[]).includes(entity)&&domain==='media_player'||(settings.covers||[]).includes(entity)&&domain==='cover';};
+  return approved.filter(entityId=>{if(!allowed(entityId))return false;const entry=entities.find(e=>e.entity_id===entityId);if(!entry||entry.disabled_by)return false;const device=devices.find(d=>d.id===entry.device_id);if(device?.disabled_by)return false;const areaId=entry.area_id||device?.area_id;if(kind==='area')return areaId===id;if(kind==='floor')return areas.some(a=>a.area_id===areaId&&a.floor_id===id);return false;});
+}
+export function scopePlan(ids,states,on,services){
+  const commands=[],skipped=[];
+  for(const id of ids){const s=states[id];if(!s||['unknown','unavailable'].includes(s.state)){skipped.push({id,reason:'غير متاح'});continue;}const domain=id.split('.')[0],features=Number(s.attributes.supported_features)||0;let service;
+    if(['light','switch'].includes(domain))service=on?'turn_on':'turn_off';
+    else if(domain==='climate'){if(!(features&(on?256:128))){skipped.push({id,reason:'لا يدعم أمر التشغيل/الإيقاف المباشر؛ يلزم إعداد مناسب'});continue;}service=on?'turn_on':'turn_off';}
+    else if(domain==='media_player'){if(!(features&(on?128:256))){skipped.push({id,reason:'لا يدعم تشغيل/إيقاف التلفزيون'});continue;}service=on?'turn_on':'turn_off';}
+    else if(domain==='cover'){if(!(features&(on?1:2))){skipped.push({id,reason:'لا يدعم فتح/إغلاق الستار'});continue;}service=on?'open_cover':'close_cover';}
+    if(!service||!services?.[domain]?.[service]){skipped.push({id,reason:'أمر غير مدعوم'});continue;}
+    commands.push({domain,service,entity_id:id});
+  }return {commands,skipped};
+}
+export async function writeRegistry(hass,kind,id,fields){
+  if(!hass.user?.is_admin)throw new Error('صلاحية الإدارة مطلوبة.');
+  if(!['floor','area'].includes(kind))throw new Error('سجل غير صالح');
+  const name=String(fields.name||'').trim();if(!name)throw new Error('اسم المجموعة أو الغرفة مطلوب.');
+  const icon=String(fields.icon||'').trim();if(icon&&!/^mdi:[a-z0-9-]+$/.test(icon))throw new Error('صيغة الأيقونة مثل mdi:home');
+  const data={type:`config/${kind}_registry/${id?'update':'create'}`,name};
+  if(id)data[kind+'_id']=id;
+  if(icon||id)data.icon=icon||null;
+  if(kind==='floor'){const level=fields.level===''?null:Number(fields.level);if(level!==null&&!Number.isInteger(level))throw new Error('ترتيب المجموعة يجب أن يكون عددًا صحيحًا.');data.level=level;}
+  else if(fields.floor_id)data.floor_id=fields.floor_id;else if(id)data.floor_id=null;
+  return hass.callWS(data);
+}
+
 // Bundled after the shell. House settings remain in HA's local dashboard storage.
 const QUICK=[['on','تشغيل الكل'],['off','إيقاف الكل'],['arrive','وصلت البيت'],['guests','ضيوف'],['sleep','نوم'],['open_covers','فتح الستائر'],['close_covers','إغلاق الستائر']];
 const PANELS=[['information','المعلومات'],['cameras','المراقبة والدخول'],['shortcuts','الاختصارات'],['outdoor','الخارجية'],['rooms','الأدوار والغرف']];
@@ -128,6 +159,12 @@ const list=value=>Array.isArray(value)?value:[];
 const asset=value=>typeof value==='string'&&value.startsWith('/local/')&&!/["'<>\\]/.test(value)?value:'';
 Object.assign(TaqaniShell.prototype,{
   settings(){return this.config?.settings||{};},
+  scopeIds(scope){return scopedEntities(this.settings(),this.entities||[],this.devices||[],this.registry?.areas||[],scope);},
+  scopeButtons(scope){const ids=this.scopeIds(scope);return `<div class="entry-controls">${[true,false].map(on=>{const p=scopePlan(ids,this._hass?.states||{},on,this._hass?.services);return `<button ${p.commands.length?`data-scope="${esc(scope)}" data-on="${on}"`:'disabled'} class="control"><strong>${on?'تشغيل الكل':'إيقاف الكل'}</strong><small>${!ids.length?'غير مهيأ — لا أجهزة معتمدة':`${p.commands.length} أمر متاح${p.skipped.length?' · '+p.skipped.length+' غير متاح/غير مدعوم':''}`}</small></button>`;}).join('')}</div>`;},
+  async runScope(scope,on){const ids=this.scopeIds(scope);const plan=scopePlan(ids,this._hass.states,on,this._hass.services);if(!plan.commands.length)return;const errors=[];for(const command of plan.commands){try{await this._hass.callService(command.domain,command.service,{entity_id:command.entity_id});}catch{errors.push(command.entity_id);}}window.alert(`أُرسلت ${plan.commands.length-errors.length} أوامر؛ تعذر إرسال ${errors.length}؛ تم تجاوز ${plan.skipped.length}. إرسال الأمر ليس تأكيدًا لاستجابة الجهاز.`);},
+  registryEditor(){const groups=groupsFromRegistry(this.registry?.floors||[],this.registry?.areas||[],this.registry?.labels||[]);return this.section('المجموعات والغرف',this.notice('المجموعات هي أدوار Home Assistant نفسها، ومنها الخارجية. تعديلات الاسم والأيقونة والانتماء تُحفظ في السجل الأصلي وتنعكس على جميع الشاشات. أزرار تشغيل وإيقاف الكل تُولد تلقائيًا للأجهزة المعتمدة فقط.')+'<div class="admin"><button data-page="admin:registry:floor:new">إضافة مجموعة / دور</button><button data-page="admin:registry:area:new">إضافة غرفة / مساحة</button></div>'+groups.map(g=>`<article class="setup-card"><h2>${esc(g.name)}</h2>${g.id!=='unassigned'?`<button data-page="admin:registry:floor:${esc(g.id)}">تعديل اسم المجموعة وأيقونتها</button><button data-new-room="${esc(g.id)}">إضافة غرفة للمجموعة</button>`:''}<div class="grid two">${g.areas.map(a=>`<button data-page="admin:registry:area:${esc(a.area_id)}"><ha-icon icon="${esc(a.icon||'mdi:floor-plan')}"></ha-icon> ${esc(a.name)} · تعديل</button>`).join('')}</div></article>`).join(''));},
+  registryForm(){const [, ,kind,key]=this.page.split(':');if(!['floor','area'].includes(kind))return this.notice('نوع سجل غير صحيح.');const id=key==='new'?'':key;const item=(kind==='floor'?this.registry?.floors:this.registry?.areas)?.find(x=>x[kind+'_id']===id)||{};if(id&&!item.name)return this.notice('السجل غير موجود.');return this.section(id?'تعديل '+(kind==='floor'?'المجموعة':'الغرفة'):'إضافة '+(kind==='floor'?'مجموعة / دور':'غرفة / مساحة'),`<form data-registry="${kind}" data-id="${esc(id)}"><div class="form-grid"><label class="field">${kind==='floor'?'اسم المجموعة':'اسم الغرفة'}<input name="name" required maxlength="100" value="${esc(item.name||'')}"></label><label class="field">الأيقونة<input name="icon" placeholder="mdi:home" value="${esc(item.icon||'')}"></label>${kind==='floor'?`<label class="field">ترتيب المجموعة / رقم الدور<input type="number" step="1" name="level" value="${esc(item.level??0)}"></label>`:`<label class="field">المجموعة / الدور<select name="floor_id"><option value="">دون مجموعة</option>${(this.registry?.floors||[]).map(f=>`<option value="${esc(f.floor_id)}" ${(item.floor_id||this.newRoomFloor)===f.floor_id?'selected':''}>${esc(f.name)}</option>`).join('')}</select></label>`}</div><div class="admin"><button type="submit">حفظ في سجل Home Assistant</button><button type="button" data-page="admin:rooms">إلغاء</button></div><p role="status" data-registry-status></p></form>`);},
+  async saveRegistry(form){const status=form.querySelector('[data-registry-status]');const button=form.querySelector('[type=submit]');button.disabled=true;this.registrySaving=true;try{const fields=Object.fromEntries(new FormData(form));await writeRegistry(this._hass,form.dataset.registry,form.dataset.id,fields);await this.load();this.newRoomFloor=null;this.navigate('admin:rooms');}catch(e){status.textContent='لم يُحفظ: '+e.message;}finally{this.registrySaving=false;button.disabled=false;}},
   dataSignature(){const ids=Object.values(this.settings()).flatMap(v=>Array.isArray(v)?v:typeof v==='string'?[v]:[]).filter(v=>/^[a-z_]+\./.test(v));const weather=this.weather();if(weather)ids.push(weather.entity_id);return JSON.stringify(ids.map(id=>this.state(id)));},
   clock(){try{return new Intl.DateTimeFormat('ar-SA',{dateStyle:'full',timeStyle:'short',timeZone:this.settings().timezone||this._hass?.config?.time_zone}).format(new Date());}catch{return new Intl.DateTimeFormat('ar-SA',{dateStyle:'full',timeStyle:'short'}).format(new Date());}},
   state(id){return this._hass?.states?.[id];},
@@ -154,7 +191,7 @@ Object.assign(TaqaniShell.prototype,{
     if(show('rooms')){
       if(this.error)out+=this.notice(this.error);
       else if(!this.registry)out+=this.notice('جارٍ تحميل الأدوار والمساحات…');
-      else out+=groupsFromRegistry(this.registry.floors,this.registry.areas,this.registry.labels).map(g=>this.section(g.name,g.areas.length?`<div class="grid">${g.areas.map(a=>this.tile(a.name,'فتح المساحة',a.icon||'mdi:floor-plan','area:'+a.area_id)).join('')}</div>`:this.notice('لا توجد مساحات مضافة لهذا الدور.'))).join('');
+      else out+=groupsFromRegistry(this.registry.floors,this.registry.areas,this.registry.labels).map(g=>this.section(g.name,(g.id==='unassigned'?'':this.scopeButtons('floor:'+g.id))+(g.areas.length?`<div class="grid">${g.areas.map(a=>`<article>${this.tile(a.name,'فتح المساحة',a.icon||'mdi:floor-plan','area:'+a.area_id)}${this.scopeButtons('area:'+a.area_id)}</article>`).join('')}</div>`:this.notice('لا توجد مساحات مضافة لهذا الدور.')))).join('');
     }
     if(this._hass?.user?.is_admin)out+=this.section('إدارة المنزل',this.tile('تجهيز المنزل وتخصيصه','إدارة هذا المنزل فقط','mdi:cog','admin'));
     return out;
@@ -188,6 +225,8 @@ Object.assign(TaqaniShell.prototype,{
   },
   diagnostics(){const settings=this.settings();const ids=[...new Set(['lights','climates','outdoor','televisions','covers','cameras'].flatMap(k=>list(settings[k])).concat(['weather','inside','outside','alerts','reminders','doorbell','door_lock','door_answer','door_end',...QUICK.map(([id])=>'action_'+id)].map(k=>settings[k]).filter(Boolean)))];return this.section('فحص الحالة والتخصيص',this.notice('الحالة مأخوذة من Home Assistant الآن. لا يوجد اختبار تشغيل تلقائي ولا نفترض أن حالة ريموت IR تعكس الجهاز الفعلي.')+`<div class="setup-grid">${ids.length?ids.map(id=>{const s=this.state(id);return `<article class="setup-card"><h2>${esc(s?.attributes.friendly_name||id)}</h2><span class="badge">${!s?'كيان مفقود':known(s)?'متاح':'غير متاح / غير معروف'}</span><p>${esc(id)} · ${esc(s?.state||'غير موجود')}</p>${s?`<button data-more-info="${esc(id)}">فحص / اختبار يدوي</button>`:''}</article>`;}).join(''):this.notice('لا توجد أجهزة أو مصادر مخصصة بعد.')}</div>`)+this.section('نواقص التجهيز',`<ul>${[['اسم المنزل',!!settings.home_name],['الإنارة',list(settings.lights).length],['التكييف',list(settings.climates).length],['الطقس',known(this.weather())],['حرارة الداخل',known(this.state(settings.inside))],['المراقبة',this.cameraIds().length],['الجرس',known(this.state(settings.doorbell))],['الاختصارات',QUICK.every(([id])=>known(this.state(settings['action_'+id]))) ]].map(([label,done])=>`<li>${label}: ${done?'مصدر محدد — يلزم التحقق الوظيفي':'ناقص'}</li>`).join('')}</ul>`);},
   detail(){
+    if(this.page.startsWith('admin:')&&this._hass?.user?.is_admin){if(this.page==='admin:rooms')return this.registryEditor();if(this.page.startsWith('admin:registry:'))return this.registryForm();}
+    if(this.page.startsWith('area:')){const area=this.registry?.areas.find(a=>'area:'+a.area_id===this.page);if(!area)return this.notice('المساحة غير موجودة.');const ids=this.scopeIds(this.page);return this.section(area.name,this.scopeButtons(this.page))+this.section('أجهزة المساحة المعتمدة',ids.length?ids.map(id=>`<div data-native-entity="${esc(id)}"></div>`).join(''):this.notice('لم تُعتمد أجهزة لهذه المساحة بعد.'))+this.section('سيناريوهات المساحة',this.notice('لم تُربط سيناريوهات خاصة بهذه المساحة.'));}
     if(this.page.startsWith('admin:')&&this._hass?.user?.is_admin){if(this.page.startsWith('admin:wizard'))return this.wizard();if(this.page==='admin:diagnostics')return this.diagnostics();}
     if(this.page.startsWith('admin')){if(!this._hass?.user?.is_admin)return this.notice('صلاحية إدارة Home Assistant مطلوبة.');const part=this.page.split(':')[1];if(!part)return this.adminHome();if(part==='thirdparty')return this.thirdParty();if(FORM_GROUPS[part])return this.editor(part);if(part==='rooms')return this.section('الأدوار والغرف',this.notice('الإضافة وإعادة التسمية والإسناد من سجل Home Assistant، وتنعكس تلقائيًا هنا. للترتيب استخدم تسمية «ترتيب: 10».')+'<a href="/config/areas/dashboard">إدارة الأدوار والغرف</a>');return this.section('الإدارة المتقدمة والتسليم',this.notice('لكل منزل حساب أدمن مستقل وحساب عرض غير إداري للشاشات. أنشئهما داخل هذا التثبيت؛ لا تُنسخ الحسابات في القالب. الحساب غير الإداري ليس نظام صلاحيات دقيقًا لكل كيان.')+`<div class="admin">${[['/config/users','حسابات المستخدمين'],['/config/integrations/dashboard','التكاملات'],['/config/script/dashboard','السكربتات'],['/config/scene/dashboard','المشاهد'],['/config/backup/overview','النسخ الاحتياطية'],['/config/logs','السجلات'],['/hacs','تحديث واجهة تقني عبر HACS']].map(([url,n])=>`<a href="${url}">${n}</a>`).join('')}</div>`);}
     if(this.page==='weather'){const w=this.weather();return this.section('تفاصيل الطقس',this.notice(w?`${w.attributes.friendly_name||'الطقس'} · ${this.weatherText()} · ${w.attributes.temperature??'غير متاح'} ${w.attributes.temperature_unit||''}`:'لا يوجد مصدر طقس مربوط.'));}
@@ -220,6 +259,9 @@ Object.assign(TaqaniShell.prototype,{
     if(asset(this.settings().background))this.shadowRoot.querySelector('.shell').style.backgroundImage=`linear-gradient(#101a2ce8,#101a2ce8),url("${this.settings().background}")`;
     this.shadowRoot.querySelectorAll('[data-camera]').forEach(el=>el.onclick=()=>this.navigate(el.hasAttribute('data-door')?'entry':'camera:'+el.dataset.camera));
     this.shadowRoot.querySelectorAll('[data-control]').forEach(el=>el.onclick=()=>this.runControl(el.dataset.control,el.dataset.mode));
+    this.shadowRoot.querySelectorAll('[data-scope]').forEach(el=>el.onclick=()=>this.runScope(el.dataset.scope,el.dataset.on==='true'));
+    this.shadowRoot.querySelectorAll('[data-new-room]').forEach(el=>el.onclick=()=>{this.newRoomFloor=el.dataset.newRoom;this.navigate('admin:registry:area:new');});
+    const registryForm=this.shadowRoot.querySelector('[data-registry]');if(registryForm)registryForm.onsubmit=e=>{e.preventDefault();this.saveRegistry(registryForm);};
     this.shadowRoot.querySelectorAll('[data-more-info]').forEach(el=>el.onclick=()=>this.dispatchEvent(new CustomEvent('hass-more-info',{detail:{entityId:el.dataset.moreInfo},bubbles:true,composed:true})));
     if(this.page==='admin'&&this._hass?.user?.is_admin){const nav=document.createElement('nav');for(const [label,page] of [['معالج إضافة وتجهيز الأجهزة','admin:wizard:1'],['فحص الحالة والتخصيص','admin:diagnostics']]){const b=document.createElement('button');b.textContent=label;b.onclick=()=>this.navigate(page);nav.appendChild(b);}this.shadowRoot.querySelector('header').after(nav);}
     const refresh=this.shadowRoot.querySelector('[data-refresh-integrations]');if(refresh)refresh.onclick=()=>this.load();
