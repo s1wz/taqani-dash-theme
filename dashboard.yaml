@@ -1,0 +1,7 @@
+title: الذكاء التقني
+views:
+  - title: الرئيسية
+    path: home
+    type: panel
+    cards:
+      - type: custom:taqani-shell
