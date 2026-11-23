@@ -1,5 +1,5 @@
 /* TAQANI phase 1. No device commands, credentials or customer data. */
-export const VERSION = '0.4.1';
+export const VERSION = '0.4.2';
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export function areaOrder(area, labels) {
   for (const id of area.labels || []) {
@@ -37,7 +37,7 @@ class TaqaniShell extends HTMLElement {
       this.devices=extra[0].status==='fulfilled'?extra[0].value:[];
       this.entities=extra[1].status==='fulfilled'?extra[1].value:[];
       this.entries=extra[2].status==='fulfilled'?extra[2].value:null;
-      if(this._hass.user?.is_admin){const domains=['sonoff','smartir','tuya','broadlink'];const manifests=await Promise.allSettled(domains.map(integration=>this._hass.callWS({type:'manifest/get',integration})));this.manifests=Object.fromEntries(domains.map((d,i)=>[d,manifests[i].status==='fulfilled'?manifests[i].value:null]));}
+      if(this._hass.user?.is_admin){const domains=['sonoff','smartir','tuya','broadlink','hue','ezviz','imou_life'];const manifests=await Promise.allSettled(domains.map(integration=>this._hass.callWS({type:'manifest/get',integration})));this.manifests=Object.fromEntries(domains.map((d,i)=>[d,manifests[i].status==='fulfilled'?manifests[i].value:null]));}
       if(!this.unsubs.length)for(const kind of ['floor','area','label','device','entity']){
         const unsub=await this._hass.connection.subscribeEvents(()=>{if(this.deviceDraftActive){this.registryRefreshPending=true;return;}this.load();},`${kind}_registry_updated`);
         if(this.isConnected)this.unsubs.push(unsub);else unsub();
@@ -231,11 +231,12 @@ Object.assign(TaqaniShell.prototype,{
     if(entries.length)return entries.every(e=>e.state==='loaded')?'التكامل محمّل — تحقق من أجهزته':'يحتاج إعدادًا / معالجة خطأ';
     const m=this.manifests?.[domain];
     if(domain==='smartir')return m?`ملفات مثبتة ${m.version||''} — ${this._hass?.config?.components?.includes('smartir')?'محمّل؛ تحقق من المنصات':'يحتاج إعداد YAML'}`:'لم يُتحقق من تثبيت الملفات';
+    if(domain==='imou_life')return m?`ملفات مثبتة ${m.version||''} — يحتاج إعداد حساب`:'يحتاج مراجعة الموديل وتثبيت Imou Life Official';
     if(domain==='sonoff')return m?`مثبت ${m.version||''} — الحساب غير مربوط`:'يحتاج تثبيت Sonoff LAN أو إعادة تحميل HA';
     return m?'تكامل أصلي متاح — غير مربوط':'تعذر التحقق من توفر التكامل';
   },
   thirdParty(){
-    const cards=[['eWeLink / SONOFF','sonoff','Sonoff LAN عبر HACS. دعم الموديل وطريقة LAN أو Cloud بحسب الجهاز؛ لا يلزم تفليش.','https://github.com/AlexxIT/SonoffLAN'],['Broadlink','broadlink','أضف الجهاز للشبكة بتطبيق الشركة أولًا. الريموتات تحتاج تعلم الأوامر أو أكواد SmartIR المتوافقة.','https://www.home-assistant.io/integrations/broadlink/'],['Tuya + Smart Life','tuya','مسار واحد للتطبيقين. يلزم حساب وجهاز مدعوم؛ رمز المستخدم وQR يدخلان في شاشة Home Assistant الأصلية.','https://www.home-assistant.io/integrations/tuya/']];
+    const cards=[['Philips Hue','hue','يلزم Hue Bridge متصل بالشبكة، ثم إقران من الحوار الأصلي. الإنارة والحساسات المدعومة تتبع الجسر؛ هذا ليس ربط Bluetooth مباشرًا.','https://www.home-assistant.io/integrations/hue/'],['EZVIZ','ezviz','يلزم حساب EZVIZ وكاميرا مدعومة؛ البث المحلي يتطلب RTSP ورمز تحقق الكاميرا. لا يضمن صوتًا ثنائي الاتجاه أو دعم كل موديل. لا تغيّر حماية الحساب قبل مراجعة متطلبات التكامل.','https://www.home-assistant.io/integrations/ezviz/'],['Imou Life','imou_life','المسار المقترح لهذا الإصدار: Imou Life Official عبر HACS، بحد أدنى HA 2025.4. يلزم App ID وApp Secret ومنطقة حساب Open Platform، وحصة API سحابية. صور التنبيهات المشفرة تحتاج مكتبات x86-64 ولا تدعم جهاز iHost armv7 الحالي. راجع الموديل قبل تثبيت التكامل؛ لم نثبته أو نربط الحساب.','https://github.com/Imou-OpenPlatform/Imou-Home-Assistant'],['eWeLink / SONOFF','sonoff','Sonoff LAN عبر HACS. دعم الموديل وطريقة LAN أو Cloud بحسب الجهاز؛ لا يلزم تفليش.','https://github.com/AlexxIT/SonoffLAN'],['Broadlink','broadlink','أضف الجهاز للشبكة بتطبيق الشركة أولًا. الريموتات تحتاج تعلم الأوامر أو أكواد SmartIR المتوافقة.','https://www.home-assistant.io/integrations/broadlink/'],['Tuya + Smart Life','tuya','مسار واحد للتطبيقين. يلزم حساب وجهاز مدعوم؛ رمز المستخدم وQR يدخلان في شاشة Home Assistant الأصلية.','https://www.home-assistant.io/integrations/tuya/']];
     const setup=cards.map(([name,domain,desc,url])=>`<article class="setup-card"><h2>${name}</h2><span class="badge">${esc(this.integrationStatus(domain))}</span><p>${desc}</p><div class="admin">${this.manifests?.[domain]?.config_flow?`<a href="/config/integrations/dashboard/add?domain=${domain}" target="_blank" rel="noopener">بدء إعداد ${name}</a>`:'<span>الإعداد غير متاح حتى تحميل التكامل</span>'}${this.entries?.some(e=>e.domain===domain)?`<a href="/config/integrations/integration/${domain}" target="_blank" rel="noopener">إدارة الربط الحالي</a>`:''}${domain==='sonoff'?'<a href="/hacs" target="_blank" rel="noopener">ملفات Sonoff LAN في HACS</a>':''}<a href="${url}" target="_blank" rel="noopener">المتطلبات والموديلات</a></div><small>يفتح إعداد التكامل الأصلي داخل مسار التجهيز مع زر ثابت للعودة إلى البرمجة؛ بيانات الحساب تُدخل في نموذج التكامل الأصلي.</small></article>`).join('');
     return this.section('خدمات الطرف الثالث',`<button data-refresh-integrations>تحديث حالات الربط</button><div class="setup-grid">${setup}<article class="setup-card"><h2>SmartIR</h2><span class="badge">${esc(this.integrationStatus('smartir'))}</span><p>إعداد YAML؛ لا يوجد معالج تسجيل حساب. يلزم تعريف smartir والمنصة والموديل ووحدة إرسال IR. لا يستورد مكتبة Broadlink تلقائيًا ولا يضمن كل الأجهزة أو الستائر.</p><div class="admin"><a href="https://github.com/smartHomeHub/SmartIR/tree/1.18.1#installation" target="_blank" rel="noopener">خطوات إعداد YAML للنسخة المتوافقة</a><a href="/hacs" target="_blank" rel="noopener">إدارة ملفات SmartIR</a></div></article><article class="setup-card"><h2>Amazon Alexa</h2><span class="badge">الربط بحساب المنزل غير متحقق</span><p>المسار السحابي: Home Assistant Cloud باشتراك بعد التجربة. المسار اليدوي: Alexa Smart Home مع حسابات ومتطلبات إضافية. لا مزامنة تلقائية لروتينات Alexa.</p><div class="admin"><a href="/config/cloud" target="_blank" rel="noopener">فتح إعداد Home Assistant Cloud</a><a href="https://www.home-assistant.io/integrations/alexa/" target="_blank" rel="noopener">المسار اليدوي والمتطلبات</a></div></article><article class="setup-card"><h2>Hikvision</h2><span class="badge">إعداد لاحق حسب الموديل</span><p>يلزم تحديد الموديل ودعم ONVIF / RTSP. لا توجد كاميرا معتمدة تلقائيًا.</p></article></div>`);
   },
@@ -318,6 +319,9 @@ Object.assign(TaqaniShell.prototype,{
 // Keep native HA setup in a same-origin frame with a persistent local return bar.
 // No iframe DOM access, credentials, native frontend patches or global injection.
 const nativeDestinations={
+ hue:['إعداد Philips Hue','/config/integrations/dashboard/add?domain=hue','admin:thirdparty'],
+ ezviz:['إعداد EZVIZ','/config/integrations/dashboard/add?domain=ezviz','admin:thirdparty'],
+ imou_life:['إعداد Imou Life','/config/integrations/dashboard/add?domain=imou_life','admin:thirdparty'],
  esphome:['إضافة شاشة ESPHome','/config/integrations/dashboard/add?domain=esphome','admin:intercom'],
  sonoff:['إعداد eWeLink / SONOFF','/config/integrations/dashboard/add?domain=sonoff','admin:thirdparty'],
  broadlink:['إعداد Broadlink','/config/integrations/dashboard/add?domain=broadlink','admin:thirdparty'],
