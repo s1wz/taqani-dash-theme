@@ -1,5 +1,5 @@
 /* TAQANI phase 1. No device commands, credentials or customer data. */
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export function areaOrder(area, labels) {
   for (const id of area.labels || []) {
@@ -20,10 +20,10 @@ const SERVICES=[['cameras','المراقبة','mdi:cctv'],['entry','الدخول
 const PLACEHOLDERS=['المساحات الخارجية','الدور الأرضي','الدور الأول — المعيشة','دور الملحق'];
 class TaqaniShell extends HTMLElement {
   constructor(){super();this.attachShadow({mode:'open'});this.page='home';this.registry=null;this.unsubs=[];this.boundRoute=()=>this.readRoute();}
-  setConfig(config){this.config=config;this.render();}
-  set hass(hass){this._hass=hass;if(this.isConnected&&!this.loading&&!this.registry)this.load();}
-  connectedCallback(){window.addEventListener('popstate',this.boundRoute);window.addEventListener('hashchange',this.boundRoute);this.readRoute();if(this._hass)this.load();}
-  disconnectedCallback(){window.removeEventListener('popstate',this.boundRoute);window.removeEventListener('hashchange',this.boundRoute);this.unsubs.splice(0).forEach(fn=>fn());}
+  setConfig(config){this.config=structuredClone(config);this.render();}
+  set hass(hass){this._hass=hass;if(this.isConnected&&!this.loading&&!this.registry)this.load();else if(!this.page.startsWith('admin'))this.render();}
+  connectedCallback(){window.addEventListener('popstate',this.boundRoute);window.addEventListener('hashchange',this.boundRoute);this.timer=setInterval(()=>{const el=this.shadowRoot.querySelector('[data-clock]');if(el)el.textContent=this.clock();},30000);this.readRoute();if(this._hass)this.load();}
+  disconnectedCallback(){clearInterval(this.timer);window.removeEventListener('popstate',this.boundRoute);window.removeEventListener('hashchange',this.boundRoute);this.unsubs.splice(0).forEach(fn=>fn());}
   getCardSize(){return 12;}
   readRoute(){try{this.page=decodeURIComponent(location.hash.slice(1)||'home');}catch{this.page='home';}this.render();}
   navigate(page){history.pushState(null,'','#'+encodeURIComponent(page));this.page=page;this.render();this.scrollIntoView({block:'start'});}
@@ -33,6 +33,10 @@ class TaqaniShell extends HTMLElement {
       const [floors,areas,labels]=await Promise.all(['floor','area','label'].map(kind=>this._hass.callWS({type:`config/${kind}_registry/list`})));
       if(!this.isConnected)return;
       this.registry={floors,areas,labels};this.error=null;
+      const extra=await Promise.allSettled([this._hass.callWS({type:'config/device_registry/list'}),this._hass.callWS({type:'config/entity_registry/list'}),this._hass.user?.is_admin?this._hass.callWS({type:'config_entries/get'}):Promise.resolve([])]);
+      this.devices=extra[0].status==='fulfilled'?extra[0].value:[];
+      this.entities=extra[1].status==='fulfilled'?extra[1].value:[];
+      this.entries=extra[2].status==='fulfilled'?extra[2].value:null;
       if(!this.unsubs.length)for(const kind of ['floor','area','label']){
         const unsub=await this._hass.connection.subscribeEvents(()=>this.load(),`${kind}_registry_updated`);
         if(this.isConnected)this.unsubs.push(unsub);else unsub();
@@ -43,7 +47,7 @@ class TaqaniShell extends HTMLElement {
   tile(title,subtitle='غير مهيأ',icon='mdi:circle-outline',page=null){return `<button ${page?'data-page="'+esc(page)+'"':'disabled'} class="tile"><ha-icon icon="${esc(icon)}"></ha-icon><strong>${esc(title)}</strong><small>${esc(subtitle)}</small></button>`;}
   notice(text){return `<p class="notice">${esc(text)}</p>`;}
   section(title,body){return `<section><h2>${esc(title)}</h2>${body}</section>`;}
-  home(){
+  legacyHome(){
     let out=this.section('الوصول السريع',`<div class="grid two">${this.tile('تشغيل الكل','غير مهيأ حتى ربط الأجهزة','mdi:power')}${this.tile('إيقاف الكل','غير مهيأ حتى ربط الأجهزة','mdi:power-off')}</div>`);
     out+=this.section('خدمات المنزل',`<div class="grid">${SERVICES.map(([id,name,icon])=>this.tile(name,'عرض التفاصيل',icon,id)).join('')}</div>`);
     out+=this.section('ملخص المنزل',`<div class="grid summaries">${['الإنارات العاملة','المكيفات العاملة','حرارة الداخل','حرارة الخارج'].map(n=>`<article><span>${n}</span><strong>غير مربوط</strong></article>`).join('')}</div>`);
@@ -86,3 +90,118 @@ if (typeof window !== 'undefined') {
     window.customCards.push({type:'taqani-shell',name:'الذكاء التقني',description:'واجهة تقني — المساحات من سجلات Home Assistant',preview:false});
   }
 }
+
+// Local review helpers; bundled runtime contains the same configuration functions.
+export function replaceShellConfig(dashboard, expected, next) {
+  const copy=structuredClone(dashboard);
+  const matches=[];
+  const visit=node=>{if(!node||typeof node!=='object')return;if(node.type==='custom:taqani-shell')matches.push(node);for(const value of Object.values(node))if(value&&typeof value==='object')Array.isArray(value)?value.forEach(visit):visit(value);};
+  visit(copy);
+  if(matches.length!==1)throw new Error('توجد أكثر من بطاقة أو البطاقة غير موجودة؛ استخدم محرر Home Assistant.');
+  if(JSON.stringify(matches[0])!==JSON.stringify(expected))throw new Error('تغيرت الإعدادات من شاشة أخرى. أعد فتح الإدارة قبل الحفظ.');
+  Object.keys(matches[0]).forEach(k=>delete matches[0][k]);Object.assign(matches[0],next);
+  return copy;
+}
+export async function saveSettings(hass, path, expected, next) {
+  if(!hass.user?.is_admin)throw new Error('صلاحية الإدارة مطلوبة.');
+  const dashboard=await hass.callWS({type:'lovelace/config',url_path:path,force:true});
+  const config=replaceShellConfig(dashboard,expected,next);
+  await hass.callWS({type:'lovelace/config/save',url_path:path,config});
+  return config;
+}
+
+// Bundled after the shell. House settings remain in HA's local dashboard storage.
+const QUICK=[['on','تشغيل الكل'],['off','إيقاف الكل'],['arrive','وصلت البيت'],['guests','ضيوف'],['sleep','نوم'],['open_covers','فتح الستائر'],['close_covers','إغلاق الستائر']];
+const PANELS=[['information','المعلومات'],['cameras','المراقبة والدخول'],['shortcuts','الاختصارات'],['outdoor','الخارجية'],['rooms','الأدوار والغرف']];
+const FORM_GROUPS={
+ house:['بيانات المنزل والواجهة',[['home_name','اسم المنزل','text'],['city','المدينة للعرض','text'],['timezone','المنطقة الزمنية (مثل Asia/Riyadh)','text'],['logo','شعار المنزل — مسار /local/','asset'],['background','الخلفية — مسار /local/','asset']]],
+ sources:['مصادر المعلومات والشاشات',[['weather','مصدر الطقس','weather'],['inside','حرارة الداخل','temperature'],['outside','حرارة الخارج — اختياري إن توفر الطقس','temperature'],['alerts','التنبيهات','sensor,binary_sensor'],['reminders','التذكيرات','todo,sensor']]],
+ devices:['الأجهزة والخارجية',[['lights','إنارة المنزل المعتمدة','multi:light,switch'],['climates','مكيفات المنزل','multi:climate'],['outdoor','أجهزة الخارجية — تبديل مباشر','multi:light,switch'],['televisions','تلفزيونات المنزل','multi:media_player'],['covers','ستائر المنزل','multi:cover']]],
+ cameras:['الكاميرات والجرس',[['cameras','كاميرات المراقبة المعتمدة','multi:camera'],['doorbell','كاميرا الجرس','camera'],['door_lock','قفل باب المدخل','lock'],['door_answer','سكربت الرد/المحادثة الخاص بتكامل الجرس','script'],['door_end','سكربت إنهاء المحادثة','script']]],
+ shortcuts:['الاختصارات ونطاقها',QUICK.flatMap(([id,name])=>[[`action_${id}`,name+' — مشهد أو سكربت','script,scene'],[`scope_${id}`,'وصف نطاق '+name,'text']])]
+};
+const oldDetail=TaqaniShell.prototype.detail;
+const oldRender=TaqaniShell.prototype.render;
+const known=state=>state&&!['unknown','unavailable'].includes(state.state);
+const list=value=>Array.isArray(value)?value:[];
+const asset=value=>typeof value==='string'&&value.startsWith('/local/')&&!/["'<>\\]/.test(value)?value:'';
+Object.assign(TaqaniShell.prototype,{
+  settings(){return this.config?.settings||{};},
+  clock(){try{return new Intl.DateTimeFormat('ar-SA',{dateStyle:'full',timeStyle:'short',timeZone:this.settings().timezone||this._hass?.config?.time_zone}).format(new Date());}catch{return new Intl.DateTimeFormat('ar-SA',{dateStyle:'full',timeStyle:'short'}).format(new Date());}},
+  state(id){return this._hass?.states?.[id];},
+  value(id){const s=this.state(id);return !id?'غير مربوط':!known(s)?'غير متاح':`${s.state} ${s.attributes.unit_of_measurement||''}`.trim();},
+  weather(){const id=this.settings().weather;const all=Object.keys(this._hass?.states||{}).filter(k=>k.startsWith('weather.'));return this.state(id||(all.length===1?all[0]:''));},
+  weatherText(){const w=this.weather();return !w?'غير مربوط':!known(w)?'غير متاح':({'sunny':'مشمس','clear-night':'صافٍ','cloudy':'غائم','partlycloudy':'غائم جزئيًا','rainy':'ممطر','pouring':'أمطار غزيرة','fog':'ضباب','windy':'رياح','windy-variant':'رياح وغيوم','snowy':'ثلوج','snowy-rainy':'ثلوج وأمطار','lightning':'رعد','lightning-rainy':'أمطار رعدية','hail':'بَرَد','exceptional':'ظروف استثنائية'}[w.state]||w.state);},
+  excludedCamera(id){const e=(this.entities||[]).find(x=>x.entity_id===id);const d=(this.devices||[]).find(x=>x.id===e?.device_id);return d?.manufacturer==='kiosk_satellite'||e?.platform==='mobile_app';},
+  cameraIds(){return list(this.settings().cameras).filter(id=>id.startsWith('camera.')&&!this.excludedCamera(id));},
+  control(title,id,mode='action'){const s=this.state(id);return `<button class="control" ${known(s)?`data-control="${esc(id)}" data-mode="${mode}"`:'disabled'}><strong>${esc(title)}</strong><small>${!id?'غير مهيأ':known(s)?esc(mode==='toggle'?(s.state==='on'?'مشغل':'مطفأ'):(s.attributes.friendly_name||id)):'غير متاح'}</small></button>`;},
+  cameraSlot(id,index,door=false){return known(this.state(id))?`<button class="feed" data-camera="${index}" ${door?'data-door':''}><div data-native-camera="${esc(id)}"></div><span>${esc(this.state(id).attributes.friendly_name||id)}</span></button>`:`<div class="empty-feed"><ha-icon icon="${door?'mdi:doorbell-video':'mdi:cctv'}"></ha-icon><strong>${id?'الكاميرا غير متاحة':door?'الجرس غير مربوط':'كاميرات المراقبة غير مربوطة'}</strong></div>`;},
+  count(ids,on){const arr=list(ids);if(!arr.length)return 'غير مربوط';const states=arr.map(id=>this.state(id));if(states.some(s=>!known(s)))return 'غير متاح — بيانات ناقصة';return String(states.filter(on).length);},
+  home(){
+    const s=this.settings(), hidden=list(s.hidden), show=id=>!hidden.includes(id), w=this.weather();
+    let out='';
+    if(show('information')){
+      const outside=s.outside?this.value(s.outside):known(w)&&Number.isFinite(w.attributes.temperature)?`${w.attributes.temperature} ${w.attributes.temperature_unit||''}`:'غير مربوط';
+      const screens=(this.devices||[]).filter(d=>d.manufacturer==='kiosk_satellite');
+      out+=`<section class="info-strip"><button class="weather-small" data-page="weather"><ha-icon icon="mdi:weather-partly-cloudy"></ha-icon><strong>${esc(outside)}</strong><small>${esc(this.weatherText())}</small></button><article><small>حرارة الداخل</small><strong>${esc(this.value(s.inside))}</strong></article><article><small>التواصل الداخلي</small><strong>${esc(screens.map(d=>d.name_by_user||d.name).join(' · ')||'لا توجد شاشات معرّفة')}</strong><small>غير مكتمل الربط</small></article><article><small>تنبيهات · تذكيرات</small><span>${esc(this.value(s.alerts))}</span><span>${esc(this.value(s.reminders))}</span></article></section>`;
+    }
+    if(show('cameras'))out+=`<div class="grid two live-panels"><section><h2>كاميرات المراقبة</h2><div class="camera-grid">${this.cameraIds().length?this.cameraIds().map((id,i)=>this.cameraSlot(id,i)).join(''):this.cameraSlot('',0)}</div><button data-page="cameras">عرض شبكة المراقبة</button></section><section><h2>الدخول الذكي والجرس</h2>${this.cameraSlot(this.excludedCamera(s.doorbell)?'':s.doorbell,0,true)}<div class="entry-controls">${this.control('رد / محادثة',s.door_answer)}${this.control('إنهاء',s.door_end)}${this.control('فتح الباب',s.door_lock,'unlock')}</div><button data-page="entry">تفاصيل المدخل</button></section></div>`;
+    if(show('shortcuts'))out+=this.section('اختصاراتك اليومية',`<div class="quick-row">${QUICK.map(([id,name])=>this.control(name,s['action_'+id])).join('')}</div>`);
+    out+=this.section('التحكم بالمنزل',`<div class="grid two">${SERVICES.filter(([id])=>['lights','climate'].includes(id)).map(([id,n,icon])=>this.tile(n,id==='lights'?this.count(s.lights,x=>x.state==='on')+' · إنارة عاملة':this.count(s.climates,x=>!['off'].includes(x.state))+' · مكيف بوضع تشغيل',icon,id)).join('')}</div>`);
+    if(show('outdoor'))out+=this.section('المساحات الخارجية',list(s.outdoor).length?`<div class="grid">${s.outdoor.map(id=>this.control(this.state(id)?.attributes.friendly_name||id,id,'toggle')).join('')}</div>`:this.notice('لم يحدد الأدمن أجهزة خارجية بعد.'));
+    if(show('rooms')){
+      if(this.error)out+=this.notice(this.error);
+      else if(!this.registry)out+=this.notice('جارٍ تحميل الأدوار والمساحات…');
+      else out+=groupsFromRegistry(this.registry.floors,this.registry.areas,this.registry.labels).map(g=>this.section(g.name,g.areas.length?`<div class="grid">${g.areas.map(a=>this.tile(a.name,'فتح المساحة',a.icon||'mdi:floor-plan','area:'+a.area_id)).join('')}</div>`:this.notice('لا توجد مساحات مضافة لهذا الدور.'))).join('');
+    }
+    if(this._hass?.user?.is_admin)out+=this.section('إدارة المنزل',this.tile('تجهيز المنزل وتخصيصه','إدارة هذا المنزل فقط','mdi:cog','admin'));
+    return out;
+  },
+  integrationStatus(domain){if(!this.entries)return 'تعذر التحقق';const entries=this.entries.filter(e=>e.domain===domain);if(!entries.length)return ['sonoff','smartir'].includes(domain)?'لم يُتحقق من تثبيته — يحتاج إعدادًا':'جاهز للإعداد — غير مربوط';return entries.every(e=>e.state==='loaded')?'التكامل محمّل — تحقق من أجهزته':'يحتاج إعدادًا / معالجة خطأ';},
+  thirdParty(){const cards=[['SmartIR','smartir','تنزيل مستقل عبر HACS ثم إعداد YAML والمنصات وأكواد الموديلات. لا يستورد مكتبة Broadlink تلقائيًا، ولا يدعم كل الأجهزة أو الستائر.','https://github.com/smartHomeHub/SmartIR'],['eWeLink / SONOFF','sonoff','SonoffLAN عبر HACS؛ دعم الموديلات وطريقة LAN أو Cloud بحسب الجهاز. لا يلزم تفليش.','https://github.com/AlexxIT/SonoffLAN'],['Broadlink','broadlink','تكامل Home Assistant الأصلي. أضف الجهاز للشبكة بتطبيق الشركة أولًا؛ الريموتات تحتاج تعلم الأوامر.','https://www.home-assistant.io/integrations/broadlink/'],['Tuya + Smart Life','tuya','مسار واحد للتطبيقين، دون نسختين. يلزم حساب وجهاز مدعوم؛ رمز المستخدم وQR داخل شاشة HA الأصلية.','https://www.home-assistant.io/integrations/tuya/']];return this.section('خدمات الطرف الثالث',`<div class="setup-grid">${cards.map(([name,domain,desc,url])=>`<article class="setup-card"><h2>${name}</h2><span class="badge">${esc(this.integrationStatus(domain))}</span><p>${desc}</p><div class="admin"><a href="/config/integrations/integration/${domain}">إدارة التكامل</a><a href="/config/integrations/dashboard?domain=${domain}">بدء الإعداد</a>${['sonoff','smartir'].includes(domain)?'<a href="/hacs">فتح HACS للتثبيت</a>':''}<a href="${url}" target="_blank" rel="noopener">المتطلبات والموديلات</a></div></article>`).join('')}<article class="setup-card"><h2>Amazon Alexa</h2><span class="badge">يلزم التحقق والربط بحساب المنزل</span><p>مسار Home Assistant Cloud يحتاج اشتراكًا بعد التجربة. الإعداد اليدوي يحتاج حسابات وخدمة Alexa Smart Home. لا مزامنة تلقائية لروتينات Alexa.</p><div class="admin"><a href="/config/cloud">إعداد Home Assistant Cloud</a><a href="https://www.home-assistant.io/integrations/alexa/" target="_blank" rel="noopener">خيارات الربط الرسمية</a></div></article><article class="setup-card"><h2>Hikvision</h2><span class="badge">إعداد لاحق حسب الموديل</span><p>حدد الموديل ودعم ONVIF / RTSP قبل ربط البث. لا توجد كاميرا معتمدة تلقائيًا.</p><a href="/config/integrations/dashboard">إدارة تكاملات الكاميرات</a></article></div>`);},
+  formField([key,label,type]){const s=this.settings(), multi=type.startsWith('multi:'), spec=multi?type.slice(6):type;let input;
+    if(['text','asset'].includes(type))input=`<input name="${key}" value="${esc(s[key]||'')}" maxlength="200" ${type==='asset'?'placeholder="/local/…"':''}>`;
+    else {let options=Object.values(this._hass?.states||{}).filter(e=>spec==='temperature'?e.attributes.device_class==='temperature':spec.split(',').includes(e.entity_id.split('.')[0]));if(spec==='camera')options=options.filter(e=>!this.excludedCamera(e.entity_id));input=`<select name="${key}" ${multi?'multiple size="6"':''}><option value="">غير مربوط</option>${options.sort((a,b)=>(a.attributes.friendly_name||a.entity_id).localeCompare(b.attributes.friendly_name||b.entity_id,'ar')).map(e=>`<option value="${esc(e.entity_id)}" ${(multi?list(s[key]).includes(e.entity_id):s[key]===e.entity_id)?'selected':''}>${esc(e.attributes.friendly_name||e.entity_id)} — ${esc(e.entity_id)}</option>`).join('')}</select>`;}
+    return `<label class="field">${esc(label)}${input}</label>`;
+  },
+  editor(group){const [title,fields]=FORM_GROUPS[group];return this.section(title,`<form data-settings="${group}"><div class="form-grid">${fields.map(f=>this.formField(f)).join('')}</div>${group==='house'?`<fieldset><legend>الأقسام الظاهرة</legend>${PANELS.map(([id,n])=>`<label><input type="checkbox" name="visible_${id}" ${list(this.settings().hidden).includes(id)?'':'checked'}> ${n}</label>`).join('')}</fieldset>`:''}<p class="notice">الحفظ محلي لهذا المنزل. لا تدخل كلمات مرور أو مفاتيح هنا. الربط لا يشغّل الأجهزة؛ اختبر الأوامر لاحقًا بعد مراجعة نطاقها.${group==='shortcuts'?' يجب إنشاء المشهد أو السكربت بنطاق الأجهزة المطلوبة في Home Assistant أولًا.':''}</p><div class="admin"><button type="submit">حفظ إعدادات المنزل</button><button type="button" data-page="admin">إلغاء</button></div><p role="status" data-save-status></p></form>`);},
+  adminHome(){const s=this.settings();return this.section('إدارة وتجهيز هذا المنزل',this.notice('هذه الواجهة للمبرمج أثناء التجهيز ولأدمن العميل بعد التسليم. صلاحية HA Admin كاملة لهذا التثبيت؛ لا توجد رتبة تقني أعلى أو حساب دعم مشترك.')+`<div class="setup-grid">${[['thirdparty','خدمات الطرف الثالث','Tuya · Smart Life · Broadlink · eWeLink · Alexa','إعداد الحسابات'],['house','بيانات المنزل والواجهة','الاسم، المدينة، الهوية والأقسام',s.home_name?'تم تخصيص الاسم':'ناقص'],['rooms','الأدوار والغرف','مصدر واحد: سجلات Home Assistant',this.registry?.areas.length?'توجد مساحات':'ناقص'],['devices','الأجهزة والخارجية','اختيار الأجهزة المعتمدة ووظائفها',list(s.lights).length||list(s.outdoor).length?'ربط جزئي':'ناقص'],['shortcuts','الاختصارات ونطاقها','مشاهد وسكربتات محددة',QUICK.some(([id])=>s['action_'+id])?'ربط جزئي':'ناقص'],['cameras','الكاميرات والجرس','اختيار البث وربط إجراءات المدخل',this.cameraIds().length?'ربط جزئي':'ناقص'],['sources','المعلومات والشاشات','طقس، حرارة، تنبيهات وتذكيرات',s.weather||s.inside?'ربط جزئي':'ناقص'],['advanced','الحسابات والتشخيص والتحديثات','أدوات Home Assistant المتقدمة','مراجعة التسليم']].map(([id,n,desc,status])=>`<button class="setup-card" data-page="admin:${id}"><h2>${n}</h2><span class="badge">${status}</span><p>${desc}</p></button>`).join('')}</div><button data-page="home">معاينة واجهة العميل</button>`);},
+  detail(){
+    if(this.page.startsWith('admin')){if(!this._hass?.user?.is_admin)return this.notice('صلاحية إدارة Home Assistant مطلوبة.');const part=this.page.split(':')[1];if(!part)return this.adminHome();if(part==='thirdparty')return this.thirdParty();if(FORM_GROUPS[part])return this.editor(part);if(part==='rooms')return this.section('الأدوار والغرف',this.notice('الإضافة وإعادة التسمية والإسناد من سجل Home Assistant، وتنعكس تلقائيًا هنا. للترتيب استخدم تسمية «ترتيب: 10».')+'<a href="/config/areas/dashboard">إدارة الأدوار والغرف</a>');return this.section('الإدارة المتقدمة والتسليم',this.notice('لكل منزل حساب أدمن مستقل وحساب عرض غير إداري للشاشات. أنشئهما داخل هذا التثبيت؛ لا تُنسخ الحسابات في القالب. الحساب غير الإداري ليس نظام صلاحيات دقيقًا لكل كيان.')+`<div class="admin">${[['/config/users','حسابات المستخدمين'],['/config/integrations/dashboard','التكاملات'],['/config/script/dashboard','السكربتات'],['/config/scene/dashboard','المشاهد'],['/config/backup/overview','النسخ الاحتياطية'],['/config/logs','السجلات'],['/hacs','تحديث واجهة تقني عبر HACS']].map(([url,n])=>`<a href="${url}">${n}</a>`).join('')}</div>`);}
+    if(this.page==='weather'){const w=this.weather();return this.section('تفاصيل الطقس',this.notice(w?`${w.attributes.friendly_name||'الطقس'} · ${this.weatherText()} · ${w.attributes.temperature??'غير متاح'} ${w.attributes.temperature_unit||''}`:'لا يوجد مصدر طقس مربوط.'));}
+    if(this.page==='cameras')return this.section('كاميرات المراقبة',`<div class="camera-grid">${this.cameraIds().length?this.cameraIds().map((id,i)=>this.cameraSlot(id,i)).join(''):this.cameraSlot('',0)}</div>`);
+    if(this.page.startsWith('camera:')){const i=Number(this.page.split(':')[1]);const id=this.cameraIds()[i];return this.section('المراقبة',id?`<div class="camera-focus" data-swipe><div data-native-camera="${esc(id)}"></div></div><div class="admin"><button data-camera-prev="${i}">السابقة</button><button data-page="cameras">الرجوع للشبكة</button><button data-camera-next="${i}">التالية</button></div>`:this.notice('الكاميرا غير مربوطة.'));}
+    if(this.page==='entry'){const s=this.settings();return this.section('الدخول الذكي',this.cameraSlot(this.excludedCamera(s.doorbell)?'':s.doorbell,0,true)+`<div class="entry-controls">${this.control('رد / محادثة',s.door_answer)}${this.control('إنهاء',s.door_end)}${this.control('فتح الباب',s.door_lock,'unlock')}</div>`+this.notice('المحادثة تعتمد على تكامل الجرس والسكربتات المحددة؛ صورة البث وحدها لا تعني دعم الصوت.'));}
+    if(['lights','climate'].includes(this.page)){const ids=list(this.settings()[this.page==='lights'?'lights':'climates']);return this.section(this.page==='lights'?'الإضاءة':'التكييف',ids.length?ids.map(id=>`<div data-native-entity="${esc(id)}"></div>`).join(''):this.notice('لا توجد أجهزة معتمدة بعد.'));}
+    return oldDetail.call(this);
+  },
+  async saveForm(form){const status=form.querySelector('[data-save-status]');const button=form.querySelector('[type=submit]');button.disabled=true;try{
+    if(!this._hass?.user?.is_admin)throw new Error('صلاحية الإدارة مطلوبة.');
+    const settings=structuredClone(this.settings());const group=form.dataset.settings;
+    for(const [key,,type] of FORM_GROUPS[group][1]){const el=form.elements.namedItem(key);settings[key]=type.startsWith('multi:')?Array.from(el.selectedOptions).map(o=>o.value).filter(Boolean):el.value.trim();if(type==='asset'&&settings[key]&&!asset(settings[key]))throw new Error('مسارات الصور يجب أن تبدأ بـ /local/ دون روابط خارجية.');}
+    if(group==='house'){settings.hidden=PANELS.filter(([id])=>!form.elements.namedItem('visible_'+id).checked).map(([id])=>id);if(settings.timezone)new Intl.DateTimeFormat('ar',{timeZone:settings.timezone}).format();}
+    const next={...this.config,settings};await saveSettings(this._hass,location.pathname.split('/')[1],this.config,next);this.config=next;status.textContent='تم الحفظ محليًا. إعدادات المنزل منفصلة عن تحديثات HACS.';
+    }catch(e){status.textContent='لم يُحفظ: '+e.message;}finally{button.disabled=false;}
+  },
+  async runControl(id,mode){const s=this.state(id);if(!known(s))return;const domain=id.split('.')[0];try{
+    if(mode==='unlock'){if(domain!=='lock'||!window.confirm('تأكيد فتح باب المدخل؟'))return;await this._hass.callService('lock','unlock',{entity_id:id});}
+    else if(mode==='toggle'){if(!['light','switch'].includes(domain)||!list(this.settings().outdoor).includes(id))return;await this._hass.callService(domain,s.state==='on'?'turn_off':'turn_on',{entity_id:id});}
+    else {if(!['script','scene'].includes(domain))return;await this._hass.callService(domain,'turn_on',{entity_id:id});}
+    }catch{window.alert('لم يُنفذ الأمر. تحقق من صلاحيات الحساب وحالة الجهاز.');}
+  },
+  async nativeCards(){const generation=this.renderGeneration;let helpers;try{helpers=await window.loadCardHelpers();}catch{return;}if(generation!==this.renderGeneration)return;for(const holder of this.shadowRoot.querySelectorAll('[data-native-camera],[data-native-entity]')){const id=holder.dataset.nativeCamera||holder.dataset.nativeEntity;if(!this.state(id))continue;const config=holder.dataset.nativeCamera?{type:'picture-entity',entity:id,camera_view:'live',show_name:false,show_state:false,tap_action:{action:'none'},hold_action:{action:'none'}}:{type:'entities',entities:[id],show_header_toggle:false};const card=helpers.createCardElement(config);card.hass=this._hass;holder.appendChild(card);}},
+  render(){
+    // Preserve an in-progress form while HA sends state changes.
+    oldRender.call(this);if(!this.shadowRoot)return;this.renderGeneration=(this.renderGeneration||0)+1;
+    const style=document.createElement('style');style.textContent=`.info-strip{display:grid;grid-template-columns:140px 1fr 1.5fr 1.5fr;gap:12px;margin:22px 0}.info-strip article,.weather-small{display:flex;flex-direction:column;justify-content:center;gap:8px;padding:16px;border-radius:18px;background:#1b2940}.info-strip small,.control small{color:#b8c7df;font-size:13px}.info-strip strong{font-size:17px}.weather-small{min-height:90px}.quick-row{display:flex;gap:12px;overflow-x:auto;padding:4px 2px 14px}.control{display:flex;flex-direction:column;gap:10px;justify-content:center;min-width:140px;min-height:92px}.control:disabled{opacity:.65;cursor:default;border-style:dashed}.live-panels section{background:#18263d;padding:20px;border-radius:22px;margin:12px 0}.camera-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}.empty-feed{min-height:200px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:18px;border:1px dashed #7790b077;border-radius:18px;color:#b8c7df;margin-bottom:14px}.empty-feed ha-icon{--mdc-icon-size:42px}.entry-controls{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.entry-controls .control{flex:1;min-width:100px}.feed{padding:0;overflow:hidden;width:100%;background:#111a2d;border-radius:16px}.feed span{display:block;padding:10px}.feed [data-native-camera]{pointer-events:none}.setup-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.setup-card{text-align:right;background:#1c2a41;padding:22px;border-radius:20px;line-height:1.8}.setup-card p{color:#b8c7df}.badge{display:inline-block;border:1px solid #7b96bf66;padding:4px 12px;border-radius:16px;font-size:13px}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.field{display:flex;flex-direction:column;gap:10px}.field input,.field select{font:inherit;color:#eef3ff;background:#1b2a44;border:1px solid #8ba3c777;border-radius:12px;min-height:48px;padding:10px;max-width:100%;width:100%}fieldset{margin-top:20px;border:1px solid #8ba3c777;border-radius:16px;padding:18px}fieldset label{display:inline-block;padding:10px}.shell header [data-clock]{font-size:14px;color:#b8c7df;margin-top:10px}.home-logo{height:52px;max-width:180px;object-fit:contain}.camera-focus{touch-action:pan-y}.camera-focus ha-card{max-height:70vh}@media(max-width:850px){.info-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.live-panels{grid-template-columns:1fr}}@media(max-width:600px){.setup-grid,.form-grid{grid-template-columns:1fr}.info-strip{gap:8px}.info-strip article{padding:12px}.info-strip strong{font-size:14px}}`;
+    this.shadowRoot.appendChild(style);const brand=this.shadowRoot.querySelector('header>div');if(brand){const clock=document.createElement('div');clock.dataset.clock='';clock.textContent=this.clock();brand.appendChild(clock);const name=document.createElement('div');name.textContent=this.settings().home_name||'';brand.appendChild(name);if(asset(this.settings().logo)){const img=document.createElement('img');img.className='home-logo';img.src=this.settings().logo;img.alt='شعار المنزل';brand.prepend(img);}}
+    if(asset(this.settings().background))this.shadowRoot.querySelector('.shell').style.backgroundImage=`linear-gradient(#101a2ce8,#101a2ce8),url("${this.settings().background}")`;
+    this.shadowRoot.querySelectorAll('[data-camera]').forEach(el=>el.onclick=()=>this.navigate(el.hasAttribute('data-door')?'entry':'camera:'+el.dataset.camera));
+    this.shadowRoot.querySelectorAll('[data-control]').forEach(el=>el.onclick=()=>this.runControl(el.dataset.control,el.dataset.mode));
+    const form=this.shadowRoot.querySelector('[data-settings]');if(form)form.onsubmit=e=>{e.preventDefault();this.saveForm(form);};
+    const move=(i,step)=>{const length=this.cameraIds().length;if(length)this.navigate('camera:'+((i+step+length)%length));};
+    this.shadowRoot.querySelectorAll('[data-camera-prev]').forEach(el=>el.onclick=()=>move(Number(el.dataset.cameraPrev),-1));this.shadowRoot.querySelectorAll('[data-camera-next]').forEach(el=>el.onclick=()=>move(Number(el.dataset.cameraNext),1));
+    const swipe=this.shadowRoot.querySelector('[data-swipe]');if(swipe){let start;swipe.onpointerdown=e=>start=e.clientX;swipe.onpointerup=e=>{if(start!==undefined&&Math.abs(e.clientX-start)>70)move(Number(this.page.split(':')[1]),e.clientX>start?-1:1);start=undefined;};}
+    this.nativeCards();
+  }
+});
